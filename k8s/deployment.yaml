@@ -20,6 +20,7 @@ spec:
       labels:
         app: api
     spec:
+      serviceAccountName: api
       containers:
       - name: api
         image: ghcr.io/amine-hassoun/devops-k8s-pipeline:latest
