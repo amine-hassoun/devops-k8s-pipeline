@@ -1,0 +1,37 @@
+namespace: app
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/amine-hassoun/devops-k8s-pipeline
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+config:
+  nodeEnv: "production"
+  port: "3000"
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "250m"
+    memory: "256Mi"
+
+hpa:
+  minReplicas: 2
+  maxReplicas: 5
+  cpuTargetUtilization: 70
+
+ingress:
+  host: api.local
+  ingressClassName: nginx
+
+serviceAccount:
+  name: api

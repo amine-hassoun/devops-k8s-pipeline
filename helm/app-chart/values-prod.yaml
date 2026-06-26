@@ -1,0 +1,17 @@
+replicaCount: 3
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+hpa:
+  minReplicas: 3
+  maxReplicas: 10
+  cpuTargetUtilization: 60
+
+ingress:
+  host: api.prod.local
