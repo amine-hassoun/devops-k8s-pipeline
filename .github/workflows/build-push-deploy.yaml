@@ -35,6 +35,12 @@ jobs:
           context: .
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      - name: Scan image for vulnerabilities
+        run: |
+          docker run --rm aquasec/trivy image \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
   deploy:
     needs: build
