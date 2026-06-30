@@ -9,6 +9,8 @@ RUN npm prune --production
 
 # Stage 2 — runtime
 FROM node:20-alpine
+RUN apk update && apk upgrade --no-cache
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 WORKDIR /app
 RUN addgroup -S app && adduser -S app -G app
 COPY --from=builder /app/node_modules ./node_modules

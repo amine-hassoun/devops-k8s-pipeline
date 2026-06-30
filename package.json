@@ -24,5 +24,11 @@
   "devDependencies": {
     "jest": "^30.4.2",
     "supertest": "^7.2.2"
+  },
+  "overrides": {
+    "cross-spawn": "^7.0.5",
+    "glob": "^11.1.0",
+    "minimatch": "^10.2.4",
+    "tar": "^7.5.11"
   }
 }
