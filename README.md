@@ -193,14 +193,21 @@ Stamping the namespace with Helm's exact ownership metadata makes Helm adopt the
 
 ## CI/CD Pipeline
 
-`.github/workflows/build-push-deploy.yaml`:
+`.github/workflows/build-push-deploy.yaml` — two jobs, two different triggers:
 
+**`build`** — runs automatically on every push to `main`:
 1. Checkout code
 2. Log in to GHCR using `GITHUB_TOKEN` — a token GitHub auto-generates per workflow run, scoped by the `permissions:` block (`packages: write` here), and never stored as a long-lived secret. No PAT, no static credential.
 3. Build the Docker image
 4. **Trivy scan** — pipeline fails closed if HIGH/CRITICAL CVEs are found (see below)
 5. Push the image to GHCR tagged with `${{ github.sha }}` — never `latest`
-6. Deploy via `helm upgrade --install ... --set image.tag=${{ github.sha }}`
+
+**`deploy`** — runs only on manual `workflow_dispatch`, never automatically on push:
+6. Configure kubeconfig from a `KUBE_CONFIG_DATA` secret
+7. Pre-create and Helm-adopt the target namespace (see the [Helm Chart](#helm-chart) namespace-adoption pattern)
+8. `helm upgrade --install ... --set image.tag=${{ github.sha }}`
+
+**Why deploy is gated, not automatic:** GitHub-hosted runners have no reachable Kubernetes cluster by default. A `deploy` job wired into the same trigger as `build` would fail on every single push — not intermittently, structurally, since there's nothing for `helm upgrade` to connect to. Rather than leave a job in the pipeline that can never succeed as designed, `deploy` only runs on an explicit `workflow_dispatch`, against a cluster whose kubeconfig is supplied as a secret. This also mirrors how most real deploy pipelines work: build/test/scan on every commit, deploy behind an explicit gate — not blind auto-deploy on every merge.
 
 **Why SHA tags, not `latest`:** every image is traceable to the exact commit that produced it, and a rollback is just redeploying a known-good SHA — no ambiguity about what `latest` currently points to. The tradeoff: `values.yaml`'s dev default of `image.tag: latest` is intentional for local development, but since the pipeline only ever publishes SHA tags, a bare `helm install` without an explicit `--set image.tag=<sha>` override will fail with `manifest unknown`. That's expected behavior, not a bug — see [Local Deployment](#local-deployment-minikube).
 
@@ -274,6 +281,7 @@ Screenshots of the verified deployment: [`docs/screenshots/`](./docs/screenshots
 - **SHA tags vs `latest` is a deliberate tradeoff, not a default to "fix."** The instinct when `manifest unknown` shows up is to make `latest` exist. The correct fix was the opposite: keep the SHA-only publishing design for traceability, and make the deploy command specify the tag explicitly.
 - **Vulnerability scanning the built image catches things `npm audit` never will.** 11 of 13 HIGH findings were in the npm CLI's own bundled dependencies — completely invisible to `npm audit`, which only looks at `package.json`'s tree — and they were unused at runtime entirely, so the real fix was removing the binary, not patching it.
 - **`kubectl patch` with `op: add` is not idempotent.** Re-running the same JSON-patch add operation multiple times appends duplicate array entries instead of no-op'ing — `op: replace` with the full desired array is the safe way to apply the same patch more than once.
+- **A CI job that can never succeed in its runner environment is worse than no job at all.** The `deploy` job was originally wired to run on every push despite GitHub-hosted runners having no reachable cluster — guaranteed to fail every single time, for reasons that had nothing to do with the code being deployed. Gating it behind `workflow_dispatch` turned a permanently-red job into an accurate signal: automatic CI now reports what's actually true (build, scan, and push all succeed), and deploy is a deliberate, on-demand action instead of a job destined to fail by design.
 
 ## Tech Stack
 
