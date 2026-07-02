@@ -3,6 +3,7 @@ name: Build, Push, Deploy
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -35,6 +36,7 @@ jobs:
           context: .
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
       - name: Scan image for vulnerabilities
         run: |
           docker run --rm aquasec/trivy image \
@@ -44,6 +46,11 @@ jobs:
 
   deploy:
     needs: build
+    # Manual only — GitHub-hosted runners have no reachable cluster by default.
+    # Automated CI stops after build+scan+push, which is what's actually true
+    # here. Deploy is deliberate, on-demand, against a cluster whose kubeconfig
+    # is supplied as a secret (see README > Local Deployment).
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,10 +62,22 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v3
 
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > ~/.kube/config
+
+      - name: Ensure namespace exists and is Helm-adopted
+        run: |
+          kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace app app.kubernetes.io/managed-by=Helm --overwrite
+          kubectl annotate namespace app \
+            meta.helm.sh/release-name=app \
+            meta.helm.sh/release-namespace=app --overwrite
+
       - name: Deploy with Helm
         run: |
           helm upgrade --install app ./helm/app-chart \
             -f helm/app-chart/values-dev.yaml \
             --set image.tag=${{ github.sha }} \
-            --namespace app \
-            --create-namespace
+            --namespace app
