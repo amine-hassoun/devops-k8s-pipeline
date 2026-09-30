@@ -19,7 +19,8 @@
   },
   "homepage": "https://github.com/amine-hassoun/devops-k8s-pipeline#readme",
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "prom-client": "^15.1.3"
   },
   "devDependencies": {
     "jest": "^30.5.2",
