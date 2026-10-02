@@ -197,24 +197,27 @@ helm/app-chart/
 
 `helm lint` clean, `helm template` produces valid YAML for every manifest.
 
-**Namespace adoption pattern (real issue, not theoretical):** this chart templates its own `Namespace` resource. On a fresh cluster, `helm install` can fail with `Error: INSTALLATION FAILED: create: failed to create: namespaces "app" not found`, even though the chart is completely valid. This isn't a chart bug; it's a race between Helm creating the Namespace and the API server finishing registration before Helm's very next resource-creation call in the same release. `--create-namespace` is not a safe workaround here, it creates an untracked namespace that then collides with the chart's own templated one.
+**Namespace adoption pattern (real issue, not theoretical, now fixed with a hook):** this chart templates its own `Namespace` resource. Submitting every chart resource in one batch, as Helm normally does, can hit a race: the Namespace create call returns before the API server has finished registering it, and the very next resource-creation call in the same batch fails with `namespaces "app" not found`, even though the chart is completely valid. `--create-namespace` doesn't fix this; it creates a second, untracked namespace that then collides with the chart's own templated one.
 
-Fix:
+Fixed by annotating the Namespace as a Helm hook, in `helm/app-chart/templates/namespace.yaml`:
 
-```bash
-kubectl create namespace app
-
-kubectl label namespace app app.kubernetes.io/managed-by=Helm
-kubectl annotate namespace app \
-  meta.helm.sh/release-name=app \
-  meta.helm.sh/release-namespace=app
-
-helm install app ./helm/app-chart -f helm/app-chart/values-dev.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-5"
 ```
 
-Stamping the namespace with Helm's exact ownership metadata makes Helm adopt the existing namespace instead of trying (and failing) to create it fresh.
+`pre-install` runs the Namespace as its own phase *before* the rest of the chart's resources are submitted, and Helm blocks until that phase completes, which is exactly the wait that closes the race. Deliberately scoped to `pre-install` only, not `pre-upgrade`: once the namespace exists, later `helm upgrade` runs skip this phase entirely, so there's no "already exists" conflict on every subsequent deploy. No `hook-delete-policy` is set, since deleting the Namespace would cascade-delete everything inside it, `helm uninstall` still tears the whole release down normally.
 
-*Backlog: convert this into a Helm `pre-install` hook so future clean-cluster installs don't need the manual pre-create step. Not implemented yet, the manual fix is well understood and this is new material beyond the original Helm curriculum.*
+Verified on a genuinely fresh cluster (`minikube delete && minikube start`, no manual `kubectl create namespace` beforehand): `helm install` succeeded on the first attempt, no race error.
+
+**Bootstrap order matters on a fresh cluster.** `ServiceMonitor` is a Custom Resource Definition installed by the Prometheus Operator, not a built-in Kubernetes kind, installing this app chart before `kube-prometheus-stack` fails with `no matches for kind "ServiceMonitor" in version "monitoring.coreos.com/v1"`, since the CRD simply doesn't exist yet. The monitoring stack must be installed first. See [Local Deployment](#local-deployment-minikube) for the corrected order.
+
+**Always pass `--namespace` explicitly on `helm install`/`helm upgrade`.** Each manifest in this chart sets its own `metadata.namespace` via `{{ .Values.namespace }}`, but that's independent of which namespace *Helm's own release bookkeeping* uses, without an explicit `--namespace` flag, Helm records the release under whatever namespace your current `kubectl` context defaults to (often `default`), even while the actual pods land correctly in `app`. The split is silent: `kubectl get pods -n app` looks fine, but `helm list` and future `helm upgrade`/`helm uninstall` calls against the wrong namespace fail or operate on nothing.
 
 **ServiceMonitor wiring:** a `ServiceMonitor`'s `selector.matchLabels` must match the target `Service`'s labels exactly, and its `endpoints[].port` refers to a **named** Service port (`name: http`), not a bare port number, a Service with an unnamed port gives the ServiceMonitor nothing to resolve, even with a perfectly correct selector. Confirmed working via Prometheus's own target list (`serviceMonitor/app/api/0`, state `UP`).
 
@@ -322,6 +325,8 @@ Screenshots: [`docs/screenshots/`](docs/screenshots)
 
 ## Local Deployment (Minikube)
 
+**Order matters:** the observability stack must go in before the app chart, the app chart's `ServiceMonitor` resource is a Custom Resource that doesn't exist until `kube-prometheus-stack`'s CRDs are installed. Verified end to end on a genuinely fresh cluster (`minikube delete && minikube start`, no pre-existing state).
+
 ```bash
 minikube start
 minikube addons enable ingress
@@ -331,23 +336,24 @@ kubectl patch deployment metrics-server -n kube-system --type='json' \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
 kubectl rollout status deployment/metrics-server -n kube-system
 
-# Pre-create + adopt the namespace (see Helm Chart section above)
-kubectl create namespace app
-kubectl label namespace app app.kubernetes.io/managed-by=Helm
-kubectl annotate namespace app \
-  meta.helm.sh/release-name=app \
-  meta.helm.sh/release-namespace=app
-
-# Deploy with the actual published SHA tag, "latest" was never published
-helm install app ./helm/app-chart \
-  -f helm/app-chart/values-dev.yaml \
-  --set image.tag=<actual-full-sha-from-ghcr>
-
-# Observability stack (see Observability section above)
+# 1. Observability stack FIRST, installs the ServiceMonitor CRD the app chart depends on
 helm install monitoring prometheus-community/kube-prometheus-stack \
   --namespace monitoring \
   --create-namespace \
   --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+
+# 2. App chart, no manual namespace pre-create needed, the chart's pre-install hook
+#    handles it (see Helm Chart section above). --namespace is always explicit,
+#    since Helm's own release bookkeeping is independent of the chart's templated
+#    resource namespaces.
+helm install app ./helm/app-chart \
+  -f helm/app-chart/values-dev.yaml \
+  --namespace app \
+  --set image.tag=<actual-full-sha-from-ghcr>
+
+# Pod readiness is scripted with kubectl wait, not a fixed sleep,
+# to avoid racing a port-forward or curl against a not-yet-Ready pod
+kubectl wait --for=condition=ready pod -l app=api -n app --timeout=60s
 ```
 
 Verify:
@@ -373,13 +379,16 @@ Screenshots of the verified deployment: [`docs/screenshots/`](docs/screenshots)
 - **Layer cache order matters more than it looks.** Copying `package*.json` before the rest of the source (before `npm ci`) means Docker only reinstalls dependencies when they actually change, not on every single source edit.
 - **NetworkPolicy is additive, not exclusive.** The moment any policy selects a pod, all unlisted traffic is denied by default, multiple policies stack their allow-rules rather than overriding each other, which is easy to get backwards under pressure.
 - **A syntactically valid Helm chart can still fail on a fresh cluster.** The namespace-registration race between Helm's Namespace creation and its next resource call isn't a chart bug, it's an API-server timing issue, and the fix (pre-create + ownership-annotation adoption) is a pattern worth reusing on any chart that templates its own Namespace.
-- **SHA tags vs `latest` is a deliberate tradeoff, not a default to "fix."** The instinct when `manifest unknown` shows up is to make `latest` exist. The correct fix was the opposite: keep the SHA-only publishing design for traceability, and make the deploy command specify the tag explicitly and specifically the **full** SHA, since `${{ github.sha }}` in Actions never matches the short 7-character form.
+- **SHA tags vs `latest` is a deliberate tradeoff, not a default to "fix."** The instinct when `manifest unknown` shows up is to make `latest` exist. The correct fix was the opposite: keep the SHA-only publishing design for traceability, and make the deploy command specify the tag explicitly, and specifically the **full** SHA, since `${{ github.sha }}` in Actions never matches the short 7-character form.
 - **A commit that was never actually pushed produces the exact same symptom as a tag-format mismatch.** Chased `manifest unknown` down two different wrong paths (short vs full SHA) before checking `git log -1 --oneline` against `origin/main` and discovering the real commit had simply never reached the remote. The lesson: verify the commit is actually on GitHub before debugging the deploy command at all.
 - **Vulnerability scanning the built image catches things `npm audit` never will.** 11 of 13 HIGH findings were in the npm CLI's own bundled dependencies, completely invisible to `npm audit`, which only looks at `package.json`'s tree, and they were unused at runtime entirely, so the real fix was removing the binary, not patching it.
 - **`kubectl patch` with `op: add` is not idempotent.** Re-running the same JSON-patch add operation multiple times appends duplicate array entries instead of no-op'ing, `op: replace` with the full desired array is the safe way to apply the same patch more than once.
 - **A CI job that can never succeed in its runner environment is worse than no job at all.** The `deploy` job was originally wired to run on every push despite GitHub-hosted runners having no reachable cluster, guaranteed to fail every single time, for reasons that had nothing to do with the code being deployed. Gating it behind `workflow_dispatch` turned a permanently-red job into an accurate signal: automatic CI now reports what's actually true (build, scan, and push all succeed), and deploy is a deliberate, on-demand action instead of a job destined to fail by design.
 - **A ServiceMonitor's selector and port reference are both silent failure points.** A label mismatch or an unnamed Service port doesn't throw an error anywhere, Prometheus just never lists the target at all. Confirming a real `UP` state in Prometheus's own target list is the only reliable verification, not just "the YAML applied cleanly."
 - **HPA bounds should be environment-tiered, not fixed.** What looked like a documentation/reality mismatch (2/5 documented vs 1/2 observed) was actually correct: production-tier bounds live in the base `values.yaml`, and `values-dev.yaml` intentionally overrides to lighter bounds for a resource-constrained local cluster. Worth stating explicitly in docs so it reads as design, not drift.
+- **A manual fix that "works" can hide a bootstrap-order dependency.** The namespace pre-create workaround had been run enough times on a cluster that already had the monitoring CRDs installed that the real install-order dependency (`ServiceMonitor` requires `kube-prometheus-stack`'s CRDs to exist first) never surfaced until testing on a genuinely fresh cluster. Converting the workaround into a `pre-install` Helm hook, and only then re-testing from zero state, is what exposed it, a reminder that a working manual fix isn't the same as a correct, reproducible bootstrap sequence.
+- **Helm's release namespace and a chart's templated resource namespace are two independent things.** Omitting `--namespace` on `helm install` doesn't fail loudly, it silently records the release under `kubectl`'s current-context default namespace while the actual pods land wherever the chart's `{{ .Values.namespace }}` says. `kubectl get pods` looks completely normal; `helm list`/`helm upgrade`/`helm uninstall` against the namespace you assumed is what breaks, later, confusingly. Always pass `--namespace` explicitly.
+- **`kubectl wait --for=condition=ready` beats a fixed `sleep` for scripting around pod startup.** A `sleep N` before `curl`ing a freshly-deployed pod is a guess; `kubectl wait` blocks until the pod is actually `Ready` (or fails loudly on a real timeout), which is what a CI script or a demo should rely on instead of a guessed delay.
 
 ## Tech Stack
 
